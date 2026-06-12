@@ -1,0 +1,76 @@
+# --- run these in your terminal ---
+export BUNDLE=$HOME/fabulous_offline_bundle     # the unzipped bundle
+export PROJ=$HOME/fabulous_demo                  # NEW clean project dir for this run
+export PDK_ROOT=$PROJ/gf180mcu                   # where the PDK will live (Step 3)
+
+mkdir -p $PROJ
+echo "BUNDLE=$BUNDLE"; echo "PROJ=$PROJ"; echo "PDK_ROOT=$PDK_ROOT"
+
+tar -C $PROJ -xzf $BUNDLE/pdk/gf180mcu.tar.gz
+
+cp -a $BUNDLE/payload/work $PROJ/
+
+inside $PROJ/work/librelane/cv32e40x_top/config.yaml and $PROJ/work/librelane/chip_core/config.yaml, at the end append these lines:
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+# --- Antenna mitigation ---------------------------------------------------------
+# gf180 PDK leaves HEURISTIC_ANTENNA_THRESHOLD unset and cell padding 0, so the
+# preemptive diode inserter (Odb.HeuristicDiodeInsertion) never runs and antenna
+# fixing relies only on post-route repair. Enable it + strengthen both repairs.
+RUN_HEURISTIC_DIODE_INSERTION: true
+HEURISTIC_ANTENNA_THRESHOLD: 150   # um; pre-insert a diode on nets longer than this
+GPL_CELL_PADDING: 2                # PDK default 0; inserter needs >0 to slot diodes
+DPL_CELL_PADDING: 1                # PDK default 0
+GRT_ANTENNA_REPAIR_ITERS: 10       # default 3
+GRT_ANTENNA_REPAIR_MARGIN: 20      # %, default 10 (over-fix)
+DRT_ANTENNA_REPAIR_ITERS: 5        # default 3
+DRT_ANTENNA_REPAIR_MARGIN: 15      # %, default 10
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+source $BUNDLE/activate.sh
+
+
+In bashrc copy all the previous exports
+
+Now open new terminal and run:
+
+source $BUNDLE/activate.sh
+cd $PROJ
+librelane work/tiles/LUT4AB/config.yaml \
+  --pdk gf180mcuD --pdk-root $PDK_ROOT --manual-pdk --design-dir $PROJ --run-tag lut4ab_v2 \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+
+
+
+for T in CIO W_IO N_term_single S_term_single; do
+  echo "=== HARDENING $T ==="
+  librelane work/tiles/$T/config.yaml \
+    --pdk gf180mcuD --pdk-root $PDK_ROOT --manual-pdk --design-dir $PROJ --run-tag ${T}_v2 \
+    --skip Checker.SetupViolations --skip Checker.HoldViolations \
+    --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
+done
+
+
+
+
+
+
+
+# Flow E — cv32e40x_top (CPU + coproc) → GDS, one clean run
+cd $PROJ
+librelane work/librelane/cv32e40x_top/config.yaml \
+  --pdk gf180mcuD --pdk-root $PDK_ROOT --manual-pdk --design-dir $PROJ --run-tag cv32e40x_top \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations \
+  --skip Checker.DisconnectedPins --skip Checker.PowerGridViolations \
+  --skip Checker.LVS --skip OpenROAD.IRDropReport --skip Magic.DRC --skip KLayout.DRC
+  
+  
+  
+  
+  
+cd $PROJ
+librelane work/librelane/chip_core/config.yaml \
+  --pdk gf180mcuD --pdk-root $PDK_ROOT --manual-pdk --design-dir $PROJ --run-tag chip_core \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations
