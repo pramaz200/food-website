@@ -263,3 +263,351 @@ signoff; the 112 are via-cut rendering differences (confirmed all on Via3 40/0).
 - Step IDs: Magic.StreamOut, KLayout.StreamOut, Magic.WriteLEF, Magic.DRC, KLayout.DRC, Magic.SpiceExtraction,
   Checker.MagicDRC, Checker.KLayoutDRC, Checker.LVS, Checker.XOR, Odb.CheckDesignAntennaProperties.
 - SRAM: 431.86×484.88 µm, VDD=Metal2, VSS=Metal1. Grid 0.005 µm. Dualgate 55/0, Via2 38/0, Via3 40/0.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# chip_core signoff — CONVERGE THE ROUTE FIRST, then DRC/LVS (corrected)
+
+This supersedes the earlier version, which was built on three assumptions now **proven wrong**
+against the actual LEFs and the LibreLane source:
+
+1. **eFPGA_top is clean on its own** (you verified: 0 DRC / 0 LVS / 0 antenna). So the 21466 Magic
+   errors are **NOT** inside the macro — there is **nothing to re-stitch** and **no Dualgate blanket
+   needed**. Every chip_core error is *integration-level*.
+2. **The SRAM has VDD/VSS power pins on Metal3** (a full-width Metal3 rail at the top edge, plus
+   fingers), not "Metal2-only." So `Metal3→Metal4` is the *correct* PDN bridge and `Metal2→Metal4` is
+   the one that creates the Via2 violations.
+3. **`MAGIC_EXT_USE_GDS_BLACKBOX` does not exist** in LibreLane (unknown keys are silently ignored —
+   it did nothing). The real lever is **`MAGIC_DRC_USE_GDS`** (default `true`).
+
+Two further hard rules learned the hard way:
+- **Never hand-edit `eFPGA_top.nl.v`'s port list.** Prepending `VDD, VSS` shifts the positional net
+  order → that is what produced the `VSS↔VDD` and `spi_miso↔fpga_miso` swaps. If you touched it, revert it.
+- **200↔1000 detailed-routing oscillation is a CONGESTION (floorplan) problem, not a DRC-rule problem.**
+  Halos / pin-order / Dualgate do nothing for it. It must be fixed before any signoff discussion.
+
+The strategy is therefore: **(A) get global routing to pass cleanly in a ~30-min loop → (B) full route +
+streamout → (C) the three real signoff fixes → (D) residual branches.**
+
+---
+
+## Setup (institute PC, ≥32 GB)
+
+```bash
+source $HOME/fabulous_offline_bundle/activate.sh
+export PROJ=$HOME/fabulous_self PDK_ROOT=$PROJ/gf180mcu
+cd $PROJ
+TAIL="--pdk gf180mcuD --pdk-root $PDK_ROOT --manual-pdk --design-dir $PROJ \
+  --skip Checker.SetupViolations --skip Checker.HoldViolations \
+  --skip Checker.MaxSlewViolations --skip Checker.MaxCapViolations"
+CFG=work/librelane/chip_core_recon/config.yaml
+PDN=work/librelane/chip_core/pdn_cfg.tcl
+```
+
+If you applied any of the institute-chat edits, **revert first**:
+```bash
+git checkout work/ip/efpga/eFPGA_top.nl.v 2>/dev/null   # or restore from prebuilt/
+git checkout cv32e40x_updated_with_coproc_working_verilog*/rtl/efpga/xif_copro_efpga.v 2>/dev/null
+# in $CFG: delete MAGIC_EXT_USE_GDS_BLACKBOX, any NETGEN_SETUP pointing at lvs_exclude/ignore files,
+#          and put the eFPGA location back to its original (do NOT use [1300,120]).
+# in $PDN: delete any define_pdn_grid sram_pdn / add_pdn_stripe Metal3 block you added.
+```
+
+---
+
+# PHASE A — Make global routing converge (do this FIRST, ~30 min per iteration)
+
+The oscillation happens because `GRT_ALLOW_CONGESTION: true` lets global routing "pass" while reporting
+overflow, then hands detailed routing an infeasible problem (hours later you find out). We flip that: make
+GRT the **fast, honest gate**, and only spend the full route once GRT is clean.
+
+## A1 — Floorplan changes in `$CFG`
+
+Your CPU + 8 SRAMs + the eFPGA's 590-pin edge are crammed into a ~1450 µm-wide left strip (eFPGA is
+2716×6144, so it eats the right side). Give that strip room:
+
+```yaml
+GRT_ALLOW_CONGESTION: false          # ← the key change: fail fast instead of oscillating in DRT
+DIE_AREA:  [0, 0, 4900, 6320]        # widen X by ~650
+CORE_AREA: [20, 20, 4880, 6300]
+PL_TARGET_DENSITY_PCT: 30            # keep low; congestion here is local, not global density
+FP_MACRO_HORIZONTAL_HALO: 10
+FP_MACRO_VERTICAL_HALO: 10
+```
+
+Move the eFPGA **right** (widens the logic strip 1450 → ~1900; the institute advice to move it *left* was
+backwards), and spread the SRAMs so their Metal2 signal pins have escape room (channels ~68 µm → ~150 µm):
+
+```yaml
+MACROS:
+  eFPGA_top:
+    # ...gds/lef/nl unchanged...
+    instances:
+      "u_cpu.xif_copro_i.xif_copro_verilog_i.efpga_i": {location: [1900, 75], orientation: N}
+  gf180mcu_fd_ip_sram__sram512x8m8wm1:
+    # ...
+    instances:
+      "u_mem.g_bank[0].g_lane[0].u_sram": {location: [120, 120],  orientation: N}
+      "u_mem.g_bank[0].g_lane[1].u_sram": {location: [700, 120],  orientation: N}
+      "u_mem.g_bank[0].g_lane[2].u_sram": {location: [120, 720],  orientation: N}
+      "u_mem.g_bank[0].g_lane[3].u_sram": {location: [700, 720],  orientation: N}
+      "u_mem.g_bank[1].g_lane[0].u_sram": {location: [120, 1320], orientation: N}
+      "u_mem.g_bank[1].g_lane[1].u_sram": {location: [700, 1320], orientation: N}
+      "u_mem.g_bank[1].g_lane[2].u_sram": {location: [120, 1920], orientation: N}
+      "u_mem.g_bank[1].g_lane[3].u_sram": {location: [700, 1920], orientation: N}
+```
+> The 8 SRAMs occupy only the bottom ~1900 µm of a 6320 µm-tall strip, so the upper strip is free for CPU
+> logic — that's fine. The congestion is local to the SRAM channels + the eFPGA pin edge, which is exactly
+> what A1 relieves.
+
+## A2 — PDN fix in `$PDN` (also de-clutters the SRAM region for routing)
+
+Delete the Metal2 bridge; keep only Metal3 (the SRAM's real wide Metal3 rail takes a clean Via3 to Metal4):
+```tcl
+# DELETE this line:
+#   add_pdn_connect -grid macro -layers "Metal2 $::env(PDN_VERTICAL_LAYER)"
+# KEEP only this:
+add_pdn_connect -grid macro -layers "Metal3 $::env(PDN_VERTICAL_LAYER)"
+```
+The SRAM stays fully powered through its Metal3 pins (and it bridges Metal2↔Metal3 internally).
+
+## A3 — Fast GRT-only run (placement + global route, NO detailed route, NO streamout)
+
+```bash
+rm -rf runs/chip_core_recon
+eval librelane $CFG $TAIL --run-tag chip_core_recon --to OpenROAD.GlobalRouting
+```
+This is ~30 min, not 5 h. Then read the verdict (no pasting needed — you decide locally):
+```bash
+R=$(ls -td runs/chip_core_recon* | head -1)
+grep -iE "congestion|overflow|GRT-00|tiles\b" $R/*globalrouting*/*.log | tail -40
+```
+
+## A4 — Branch on the GRT result
+
+- **GRT finishes with no overflow / "congestion: 0"** → the route will converge. Go to **PHASE B**.
+- **GRT errors with overflow, hotspot near the SRAM coordinates (x≈120–1130, y≈120–2400)** → SRAM
+  pin-escape congestion. In `$CFG` widen the channels more (col2 `700`→`760`, row pitch `600`→`660`) and/or
+  bump `FP_MACRO_*_HALO` to 14. Re-run A3.
+- **GRT overflow along the eFPGA edge (x≈1900, full height)** → the 590-pin macro edge is saturating the
+  strip. Widen the strip further: `DIE_AREA` X `4900`→`5400`, eFPGA `[1900,75]`→`[2300,75]`. Re-run A3.
+- **GRT overflow spread globally (not localized)** → genuine density. Lower `PL_TARGET_DENSITY_PCT` `30`→`22`
+  and re-run A3.
+- **GRT passes only because you left `GRT_ALLOW_CONGESTION: true`** → it will still oscillate in DRT. Set it
+  `false` and actually resolve the hotspot above; do not proceed on a masked pass.
+
+Iterate A1–A4 (each ~30 min) until GRT is clean. **Only then** spend the long run.
+
+---
+
+# PHASE B — Full route + streamout (only after GRT is clean)
+
+```bash
+rm -rf runs/chip_core_recon
+eval librelane $CFG $TAIL --run-tag chip_core_recon --to KLayout.StreamOut
+R=$(ls -td runs/chip_core_recon* | head -1)
+# detailed routing should now converge to 0 (or a handful), not oscillate:
+grep -iE "number of violations|drc viol|completing" $R/*detailedrouting*/*.log | tail -10
+# power must be connected:
+grep -ch PSM-0069 $R/*generatepdn*/*.log    # want 0
+ls -la $R/*magic-streamout*/chip_core.gds $R/*klayout-streamout*/chip_core.gds
+```
+If detailed routing *still* oscillates here even though GRT passed clean, that's a real DRT/Via issue, not
+congestion — go to PHASE D §"DRT oscillates after clean GRT".
+
+If `--to KLayout.StreamOut` aborts before streamout on a timing/extraction step, add the same skips we used
+for the macro and re-run: `--skip OpenROAD.RCX --skip OpenROAD.STAPostPNR --skip OpenROAD.IRDropReport`
+(RCX writes an empty SPEF on this PDK; those are timing-only, irrelevant to DRC/LVS).
+
+---
+
+# PHASE C — The three real signoff fixes
+
+These are applied to `$CFG`/`$PDN` and then you run DRC+LVS once. C2 is already done if you did A2.
+
+## C1 — Magic DRC 21466 → `MAGIC_DRC_USE_GDS: false`
+
+Those 21466 are the **SRAM's 5 V devices** checked *flat*: `DV6+DV3` (5/6 V diffusion to 3.3 V tap),
+"LV and MV dev can't be in the same well", `DF.8`, `CO.4`, `DF.3a`, `DF.9`. They are **inside PDK IP** that
+GF signed off and waived; Magic re-flags them because it loses the SRAM's dualgate/waiver context when it
+flattens the GDS. (KLayout doesn't fire them — that's why KLayout is 664, not 21k.)
+
+Add to `$CFG`:
+```yaml
+MAGIC_DRC_USE_GDS: false      # Magic DRCs the abstract/DEF view → SRAM & eFPGA internals not flattened
+```
+Magic then checks only chip_core-level geometry (std cells, routing, PDN). KLayout (`run_mode: deep`,
+hierarchy-aware) remains your authoritative signoff and already black-boxes the IP correctly — **leave
+KLAYOUT_DRC_OPTIONS as-is; do NOT switch run_mode to hierarchical** (that won't remove real violations).
+This is a legitimate signoff combo: each macro was DRC-clean on its own (eFPGA verified, SRAM is GF IP).
+
+## C2 — KLayout/Magic Via2 (V2.1:384, V2.2b:60, M3.2a:4 = 448) → drop the Metal2 PDN bridge
+
+Already done in **A2**. Mechanism: `add_pdn_connect "Metal2 Metal4"` forces a Via2→thin-Metal3-stub→Via3
+stack; the auto stub is min-width (~0.26 µm) but Via2 needs ≥0.28 µm of surrounding metal (V2.1 = cut +
+2×V2.3 enclosure) → 384 fails. The SRAM's real Metal3 rail makes the stub unnecessary, so removing the
+Metal2 line eliminates all 448 at the source. (If you skipped A2, do it now.)
+
+## C3 — LVS 5–6 errors → revert the hacks, then handle eFPGA power the supported way
+
+Most of what you saw was self-inflicted by the nl.v/RTL edits. Order of operations:
+
+1. **Revert** `eFPGA_top.nl.v` and `xif_copro_efpga.v` (Setup section). This alone clears the `VSS↔VDD` and
+   `spi_miso↔fpga_miso` swaps — they were positional-port corruption, not real opens.
+2. Run LVS and read the report (you decide locally):
+   ```bash
+   eval librelane $CFG $TAIL --last-run --from Magic.WriteLEF --to Checker.LVS
+   R=$(ls -td runs/chip_core_recon* | head -1)
+   sed -n '/Subcircuit summary/,/Cell pin lists/p' $R/*netgen-lvs*/*.log | head -150
+   ```
+3. **Branch on what the report shows:**
+   - **Only `eFPGA_top` VDD/VSS unmatched (layout has the connection, schematic doesn't)** → expected for a
+     hardened black box. Add the eFPGA to managed PDN so the connection is declared, in `$CFG`:
+     ```yaml
+     PDN_MACRO_CONNECTIONS:
+       - ".*u_sram VDD VSS VDD VSS"
+       - ".*efpga_i VDD VSS VDD VSS"
+     ```
+     and remove `eFPGA_top` from `IGNORE_DISCONNECTED_MODULES`. Re-run step 2. If 2 power-pin mismatches
+     still remain, they are the known black-box supply pins and are waivable for a research tapeout —
+     **do not** patch nl.v to "fix" them (that reintroduces the swap).
+   - **A miso/signal net still mismatched after the revert** → now it's potentially a real connectivity
+     issue. Check the RTL nets, don't guess:
+     ```bash
+     grep -nE "miso|fpga_miso|spi_miso" \
+       cv32e40x_updated_with_coproc_working_verilog*/soc/chip_core.sv \
+       cv32e40x_updated_with_coproc_working_verilog*/rtl/efpga/xif_copro_efpga.v
+     ```
+     If the two ports are driven by the same wire with an ambiguous name, give the chip-level wire its own
+     explicit name in `chip_core.sv`. If they're genuinely separate, the layout net is open → re-run
+     `--from OpenROAD.GlobalRouting` (it routed before the floorplan change; confirm it still connects).
+   - **An off-by-one net count (e.g. 22171 vs 22172) with a power net split** → a supply got split by the PDN
+     change. Re-check `PDN_MACRO_CONNECTIONS` instance globs match the real paths:
+     ```bash
+     grep -oE "u_sram|efpga_i" $R/*/chip_core.nl.v | sort | uniq -c
+     ```
+
+## C4 — KLayout residual (~216 after C2: density + antenna)
+
+```yaml
+RUN_HEURISTIC_DIODE_INSERTION: true
+HEURISTIC_ANTENNA_THRESHOLD: 90
+RUN_FILL_INSERTION: true
+```
+Antenna: the long CPU→eFPGA-pin routes need diodes (same fix that worked for the stitch run). Density: GF180
+wants 20–80 % metal density per window; fill insertion covers the sparse strips. The wider strip from
+PHASE A also helps fill meet the floor near the macro boundary.
+
+## C5 — XOR 112 (all Via3, 40/0) → waive
+
+These are via-cut rendering differences between the Magic and KLayout streamout views of a black-box macro —
+not physical. Treat the KLayout GDS as signoff:
+```yaml
+PRIMARY_GDSII_STREAMOUT_TOOL: klayout
+```
+
+After C1–C5, run the back end once:
+```bash
+eval librelane $CFG $TAIL --last-run --from Magic.WriteLEF --to Checker.LVS
+```
+Expected: Magic DRC → small chip-level count, KLayout DRC → ~0–50 (residual density), XOR → 0, LVS → 0
+(or 2 waived eFPGA supply pins).
+
+---
+
+# PHASE D — Residual branches (read the step dirs; decide locally)
+
+```bash
+R=$(ls -td runs/chip_core_recon* | head -1)
+# Magic DRC residual by rule:
+grep -ohE "[A-Z]+\.[0-9]+[a-z]?|via2|Diffusion|Dualgate" $R/*checker-magicdrc*/*.{rpt,log} 2>/dev/null \
+  | sort | uniq -c | sort -rn | head -30
+# KLayout DRC residual by rule:
+grep -oE "<category>[^<]+</category>" $R/*klayout-drc*/*.lyrdb 2>/dev/null | sed -E 's#</?category>##g' \
+  | sort | uniq -c | sort -rn
+```
+
+### DRT oscillates even after a clean GRT pass
+Not congestion then — it's a Via/obstruction conflict. Check *where* the markers are:
+```bash
+grep -iE "Metal[0-9]|Via[0-9]|\( *[0-9]+ +[0-9]+ *\)" $R/*detailedrouting*/*.log | tail -40
+```
+- Clustered on **Via2/Metal3 at SRAM coords** → the Metal2 PDN bridge is still present; redo **A2/C2**.
+- On **Metal4/Metal5 over the eFPGA** → over-the-macro routing is colliding with the macro's top-metal PDN.
+  Add `GRT_MACRO_EXTENSION: 0` to `$CFG` and set `GRT_ALLOW_CONGESTION: false`; re-run from GlobalRouting.
+
+### Via2 still high and the markers are INSIDE the SRAM footprint
+That's SRAM-internal geometry leaking into KLayout — confirm `run_mode: deep` with `topcell: chip_core` is
+set (it is in the baseline) so KLayout black-boxes the IP. If markers persist inside the SRAM, point the SRAM
+`gds` in `$CFG` at a LEF-derived stub (boundary+pins only) — but only if C2 didn't clear them, which it
+should.
+
+### Magic DRC still ~thousands after C1
+`MAGIC_DRC_USE_GDS: false` didn't take effect — confirm it's spelled exactly and is a top-level key in `$CFG`
+(grep the resolved config): 
+```bash
+grep -i MAGIC_DRC_USE_GDS $R/resolved.json $R/*/resolved.json 2>/dev/null
+```
+If it shows `true`, the key is in the wrong scope/misspelled.
+
+### LVS still fails after C3
+Re-read the `Subcircuit summary`. The only acceptable residual is the 2 eFPGA supply pins (waivable). Any
+signal-net mismatch is a real open/short — fix it in RTL or routing, **never** by editing nl.v port order.
+
+---
+
+# Appendix — verified facts (checked against the LEFs + LibreLane source)
+
+- **eFPGA_top**: 2716.69 × 6144.52 µm; 590 signal pins on Metal3, on **both** left (x≈0.7) and right
+  (x≈2715) edges; **no power pins in the OpenROAD-abstract LEF**, but the Magic-generated LEF (institute
+  build) does carry Metal5 VDD/VSS. Verified 0 DRC/LVS/antenna standalone.
+- **SRAM** `gf180mcu_fd_ip_sram__sram512x8m8wm1`: 431.86 × 484.88 µm. VDD/VSS pins on **Metal1, Metal2 AND
+  Metal3**. Metal3 VDD/VSS is a full-width rail (`RECT 0 479.880 431.860 480.880`) → clean Via3 to Metal4.
+  Contains 5 V devices → fires DV/DF/CO when checked flat (use C1).
+- **gf180 PDN default layers**: RAIL=Metal1, VERTICAL=Metal4, HORIZONTAL=Metal5.
+- **Real LibreLane variables** (the ones that exist): `MAGIC_DRC_USE_GDS` (default true),
+  `GRT_ALLOW_CONGESTION`, `GRT_MACRO_EXTENSION`, `DRT_OPT_ITERS`, `PDN_MACRO_CONNECTIONS`,
+  `PDN_CONNECT_MACROS_TO_GRID`, `LVS_FLATTEN_CELLS`, `RUN_HEURISTIC_DIODE_INSERTION`,
+  `HEURISTIC_ANTENNA_THRESHOLD`, `RUN_FILL_INSERTION`, `PRIMARY_GDSII_STREAMOUT_TOOL`.
+  **Do not exist** (silently ignored if used): `MAGIC_EXT_USE_GDS_BLACKBOX`, `lvs_exclude_port`,
+  `ignore class` (netgen).
+- **Step IDs**: OpenROAD.GlobalRouting, OpenROAD.DetailedRouting, OpenROAD.GeneratePDN, Magic.StreamOut,
+  KLayout.StreamOut, Magic.WriteLEF, Magic.DRC, KLayout.DRC, Checker.MagicDRC, Checker.KLayoutDRC,
+  Checker.LVS, Checker.XOR, OpenROAD.RCX, OpenROAD.STAPostPNR, OpenROAD.IRDropReport.
+- **Layers**: Dualgate 55/0, Via2 38/0, Via3 40/0, COMP 22/0, Metal3 42/0. Grid 0.005 µm, DBU 2000/µm.
+- **gf180 DRC rules referenced**: V2.1 (Via2 enclosure), V2.2a/V2.2b (Via2 spacing/array), M3.2a (Metal3
+  spacing 0.28), DF.3a/DF.8/DF.9 (diffusion), CO.4 (contact), DV.3/DV.6 (dualgate 5 V spacing to 3.3 V tap).
+```
+
